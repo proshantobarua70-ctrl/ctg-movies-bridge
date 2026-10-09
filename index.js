@@ -7,8 +7,14 @@ const PAGE_SIZE = 100;
 function send(res, status, data, type = "application/json; charset=utf-8") {
   res.statusCode = status;
   res.setHeader("Content-Type", type);
-  res.setHeader("Cache-Control", "public, s-maxage=60, stale-while-revalidate=120");
-  res.end(type.includes("application/json") ? JSON.stringify(data) : data);
+  res.setHeader(
+    "Cache-Control",
+    "public, s-maxage=60, stale-while-revalidate=120"
+  );
+
+  res.end(
+    type.includes("application/json") ? JSON.stringify(data) : data
+  );
 }
 
 function parseArray(value) {
@@ -26,20 +32,39 @@ function parseArray(value) {
 function cleanUrl(value) {
   if (typeof value !== "string") return "";
 
-  let url = value.trim();
+  let input = value.trim();
 
-  // Markdown: [https://example.com/file.mp4](https://example.com/file.mp4)
-  const markdown = url.match(/^\[.*?\]\((https?:\/\/[^)]+)\)$/);
-  if (markdown) url = markdown[1];
+  // Handle escaped characters that may occur in copied data.
+  input = input.replace(/\\([:/])/g, "$1");
 
-  // Decode common escaped characters without damaging URL encoding.
-  url = url.replace(/&amp;/g, "&");
+  // Prefer the actual URL inside a Markdown link.
+  const markdown = input.match(
+    /\]\((https?:\/\/[^)\s]+)\)/i
+  );
+
+  let url;
+
+  if (markdown) {
+    url = markdown[1];
+  } else {
+    // Also accept plain URLs or Markdown containing a URL label.
+    const matches = input.match(/https?:\/\/[^\s)\]]+/ig);
+    if (!matches || !matches.length) return "";
+    url = matches[matches.length - 1];
+  }
+
+  url = url
+    .replace(/&amp;/g, "&")
+    .replace(/[.,;]+$/, "");
 
   try {
     const parsed = new URL(url);
-    return ["http:", "https:"].includes(parsed.protocol)
-      ? parsed.href
-      : "";
+
+    if (!["http:", "https:"].includes(parsed.protocol)) {
+      return "";
+    }
+
+    return parsed.href;
   } catch {
     return "";
   }
@@ -53,51 +78,82 @@ function getCategory(item) {
   const kind = String(item.kind || item.type || "").toLowerCase();
 
   if (kind.includes("anime")) return "anime";
-  if (kind === "tv" || kind.includes("series") || kind.includes("show")) {
+
+  if (
+    kind === "tv" ||
+    kind.includes("series") ||
+    kind.includes("show")
+  ) {
     return "tv";
   }
-  if (kind.includes("movie") || kind === "film") return "movie";
+
+  if (kind.includes("movie") || kind === "film") {
+    return "movie";
+  }
 
   return kind || "unknown";
 }
 
-function normalizeLinks(rawLinks, episodeName = "") {
-  const output = [];
+function normalizeSubtitles(rawSubs) {
+  return parseArray(rawSubs)
+    .map((sub) => {
+      if (typeof sub === "string") {
+        return {
+          label: "Subtitle",
+          url: cleanUrl(sub)
+        };
+      }
 
-  for (const raw of parseArray(rawLinks)) {
-    const link = typeof raw === "string" ? { url: raw } : raw || {};
-    const url = cleanUrl(link.url || link.href || link.link || "");
+      sub = sub || {};
 
-    if (!url) continue;
-
-    const subtitles = parseArray(link.subs)
-      .map((sub) => ({
+      return {
         label: sub.label || sub.language || "Subtitle",
         url: cleanUrl(sub.url || sub.href || sub.link || "")
-      }))
-      .filter((sub) => sub.url);
+      };
+    })
+    .filter((sub) => sub.url);
+}
 
-    output.push({
-      title: [
-        episodeName,
-        link.quality || link.title || link.name || link.label || "Open source"
-      ].filter(Boolean).join(" — "),
-      url,
-      quality: link.quality || "",
-      source: link.source || "",
-      subtitles
-    });
-  }
+function normalizeLinks(rawLinks) {
+  return parseArray(rawLinks)
+    .map((raw) => {
+      const link =
+        typeof raw === "string" ? { url: raw } : raw || {};
 
-  return output;
+      const url = cleanUrl(
+        link.url || link.href || link.link || ""
+      );
+
+      if (!url) return null;
+
+      return {
+        title:
+          link.quality ||
+          link.title ||
+          link.name ||
+          link.label ||
+          "Open source",
+        url,
+        quality: link.quality || "",
+        source: link.source || "",
+        subtitles: normalizeSubtitles(link.subs || link.subtitles)
+      };
+    })
+    .filter(Boolean);
 }
 
 function normalizeItem(item) {
   const episodes = parseArray(item.episodes).map((episode) => {
-    const name = episode.name ||
-      (episode.s && episode.e
-        ? "S" + episode.s + "E" + String(episode.e).padStart(2, "0")
-        : "Episode");
+    const name =
+      episode.name ||
+      (
+        episode.s && episode.e
+          ? "S" +
+            episode.s +
+            "E" +
+            String(episode.e).padStart(2, "0")
+          : "Episode"
+      );
 
     return {
       season: episode.s || null,
@@ -110,9 +166,9 @@ function normalizeItem(item) {
     };
   });
 
-  // Movies use item.links; TV/anime sources often live inside episodes.
   const directLinks = normalizeLinks(item.links);
 
+  // Include episode links in the top-level list as well.
   const allLinks = [
     ...directLinks,
     ...episodes.flatMap((episode) =>
@@ -137,16 +193,21 @@ function normalizeItem(item) {
 
 async function loadPage(page) {
   const url = new URL(WORKER_API);
+
   url.searchParams.set("page", String(page));
   url.searchParams.set("limit", String(PAGE_SIZE));
 
   const response = await fetch(url.toString(), {
-    headers: { Accept: "application/json" },
+    headers: {
+      Accept: "application/json"
+    },
     signal: AbortSignal.timeout(15000)
   });
 
   if (!response.ok) {
-    throw new Error("Cloudflare Worker HTTP " + response.status);
+    throw new Error(
+      "Cloudflare Worker returned HTTP " + response.status
+    );
   }
 
   const data = await response.json();
@@ -160,15 +221,20 @@ async function loadPage(page) {
         : null;
 
   if (!items) {
-    throw new Error("Worker response does not contain an items array");
+    throw new Error(
+      "Worker response does not contain an items array"
+    );
   }
 
-  return {
-    items,
-    total: Number.isFinite(Number(data.total)) && data.total != null
-      ? Number(data.total)
-      : null
-  };
+  const totalValue = data.total ?? data.count ?? null;
+  const total =
+    totalValue !== null &&
+    totalValue !== "" &&
+    Number.isFinite(Number(totalValue))
+      ? Number(totalValue)
+      : null;
+
+  return { items, total };
 }
 
 function pageHtml() {
@@ -189,7 +255,7 @@ input,select,button{padding:11px;border:1px solid #424b5c;border-radius:7px;back
 input{flex:1;min-width:180px}
 button{cursor:pointer}
 button:disabled{opacity:.4;cursor:default}
-#status{color:#bac4d6;margin:14px 0}
+#status{color:#bac4d6;margin:14px 0;overflow-wrap:anywhere}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:13px}
 .card{background:#1b2230;border:1px solid #30394a;border-radius:9px;padding:14px;min-width:0}
 .card img{width:100%;max-height:240px;object-fit:contain;border-radius:6px;margin-bottom:10px}
@@ -206,11 +272,11 @@ nav{display:flex;align-items:center;gap:12px;margin:22px 0}
 <body>
 <header>
 <h1>CTG Movies Catalog</h1>
-<div>Movies · TV · Anime · Available source links</div>
+<div>Movies · TV · Anime · Source links</div>
 </header>
 <main>
 <div class="controls">
-<input id="search" placeholder="Search loaded items..." aria-label="Search loaded items">
+<input id="search" placeholder="Search loaded items..." aria-label="Search">
 <select id="kind" aria-label="Category">
 <option value="all">All categories</option>
 <option value="movie">Movies</option>
@@ -221,21 +287,25 @@ nav{display:flex;align-items:center;gap:12px;margin:22px 0}
 <div id="status">Loading catalog...</div>
 <div id="grid" class="grid"></div>
 <nav>
-<button id="prev">Previous</button>
+<button id="prev" disabled>Previous</button>
 <span id="page">Page 1</span>
-<button id="next">Next</button>
+<button id="next" disabled>Next</button>
 </nav>
 </main>
 <script>
-const $ = id => document.getElementById(id);
+const $ = (id) => document.getElementById(id);
+
 let currentPage = 1;
 let items = [];
 let canGoNext = false;
+let loading = false;
 
 function safeUrl(value) {
   try {
     const url = new URL(value);
-    return ["http:", "https:"].includes(url.protocol) ? url.href : "";
+    return ["http:", "https:"].includes(url.protocol)
+      ? url.href
+      : "";
   } catch {
     return "";
   }
@@ -249,21 +319,23 @@ function addLink(parent, link) {
   a.href = url;
   a.target = "_blank";
   a.rel = "noopener noreferrer";
-  a.textContent = link.title || link.quality || "Open source";
+  a.textContent =
+    link.title || link.quality || "Open source";
+
   parent.appendChild(a);
 
-  if (Array.isArray(link.subtitles)) {
-    for (const sub of link.subtitles) {
-      const subUrl = safeUrl(sub.url);
-      if (!subUrl) continue;
+  for (const sub of link.subtitles || []) {
+    const subUrl = safeUrl(sub.url);
+    if (!subUrl) continue;
 
-      const subtitle = document.createElement("a");
-      subtitle.href = subUrl;
-      subtitle.target = "_blank";
-      subtitle.rel = "noopener noreferrer";
-      subtitle.textContent = "Subtitle: " + (sub.label || "Open");
-      parent.appendChild(subtitle);
-    }
+    const subtitle = document.createElement("a");
+    subtitle.href = subUrl;
+    subtitle.target = "_blank";
+    subtitle.rel = "noopener noreferrer";
+    subtitle.textContent =
+      "Subtitle: " + (sub.label || "Open");
+
+    parent.appendChild(subtitle);
   }
 }
 
@@ -271,10 +343,14 @@ function render() {
   const query = $("search").value.trim().toLowerCase();
   const kind = $("kind").value;
 
-  const filtered = items.filter(item => {
-    const matchesName = !query ||
+  const filtered = items.filter((item) => {
+    const matchesName =
+      !query ||
       String(item.title).toLowerCase().includes(query);
-    const matchesKind = kind === "all" || item.kind === kind;
+
+    const matchesKind =
+      kind === "all" || item.kind === kind;
+
     return matchesName && matchesKind;
   });
 
@@ -299,7 +375,8 @@ function render() {
 
     const meta = document.createElement("div");
     meta.className = "meta";
-    meta.textContent = item.kind.toUpperCase() +
+    meta.textContent =
+      item.kind.toUpperCase() +
       (item.year ? " · " + item.year : "");
     card.appendChild(meta);
 
@@ -309,35 +386,40 @@ function render() {
       card.appendChild(overview);
     }
 
-    const linksBox = document.createElement("div");
-    linksBox.className = "links";
+    const directBox = document.createElement("div");
+    directBox.className = "links";
 
     for (const link of item.links || []) {
-      addLink(linksBox, link);
+      addLink(directBox, link);
     }
 
-    if (linksBox.children.length) {
-      card.appendChild(linksBox);
+    if (directBox.children.length) {
+      card.appendChild(directBox);
     }
 
-    if (item.episodes && item.episodes.length) {
+    const episodes = item.episodes || [];
+
+    if (episodes.length) {
       const details = document.createElement("details");
       const summary = document.createElement("summary");
-      summary.textContent = "Episodes (" + item.episodes.length + ")";
+
+      summary.textContent =
+        "Episodes (" + episodes.length + ")";
+
       details.appendChild(summary);
 
-      for (const episode of item.episodes) {
+      for (const episode of episodes) {
         const section = document.createElement("div");
         section.className = "episode";
 
-        const episodeTitle = document.createElement("strong");
-        episodeTitle.textContent = episode.name;
-        section.appendChild(episodeTitle);
+        const heading = document.createElement("strong");
+        heading.textContent = episode.name || "Episode";
+        section.appendChild(heading);
 
         if (episode.overview) {
-          const text = document.createElement("p");
-          text.textContent = episode.overview;
-          section.appendChild(text);
+          const description = document.createElement("p");
+          description.textContent = episode.overview;
+          section.appendChild(description);
         }
 
         const episodeLinks = document.createElement("div");
@@ -348,10 +430,10 @@ function render() {
         }
 
         if (!episodeLinks.children.length) {
-          const noLinks = document.createElement("div");
-          noLinks.className = "meta";
-          noLinks.textContent = "No links found for this episode";
-          episodeLinks.appendChild(noLinks);
+          const none = document.createElement("div");
+          none.className = "meta";
+          none.textContent = "No links found for this episode";
+          episodeLinks.appendChild(none);
         }
 
         section.appendChild(episodeLinks);
@@ -361,29 +443,36 @@ function render() {
       card.appendChild(details);
     }
 
-    if (!linksBox.children.length &&
-        !(item.episodes || []).some(ep => (ep.links || []).length)) {
-      const noLinks = document.createElement("div");
-      noLinks.className = "meta";
-      noLinks.textContent = "No playable links found in this item";
-      card.appendChild(noLinks);
+    if (
+      !directBox.children.length &&
+      !episodes.some((episode) => (episode.links || []).length)
+    ) {
+      const none = document.createElement("div");
+      none.className = "meta";
+      none.textContent = "No source links found";
+      card.appendChild(none);
     }
 
     $("grid").appendChild(card);
   }
 
   $("status").textContent =
-    filtered.length + " matching items · " +
-    items.length + " items loaded on this page";
+    filtered.length +
+    " matching items · " +
+    items.length +
+    " loaded on this page";
 
   $("page").textContent = "Page " + currentPage;
-  $("prev").disabled = currentPage <= 1;
-  $("next").disabled = !canGoNext;
+  $("prev").disabled = loading || currentPage <= 1;
+  $("next").disabled = loading || !canGoNext;
 }
 
 async function loadCatalog() {
-  $("status").textContent = "Loading page " + currentPage + "...";
-  $("grid").replaceChildren();
+  if (loading) return;
+
+  loading = true;
+  $("status").textContent =
+    "Loading catalog page " + currentPage + "...";
   $("prev").disabled = true;
   $("next").disabled = true;
 
@@ -396,26 +485,39 @@ async function loadCatalog() {
     const data = await response.json();
 
     if (!response.ok || data.ok !== true) {
-      throw new Error(data.error || "Catalog request failed");
+      throw new Error(
+        data.error || "Catalog request failed"
+      );
     }
 
-    items = data.items || [];
-    canGoNext = items.length === 100;
-    render();
+    items = Array.isArray(data.items) ? data.items : [];
+
+    canGoNext =
+      data.total !== null &&
+      Number.isFinite(Number(data.total))
+        ? currentPage * 100 < Number(data.total)
+        : items.length === 100;
   } catch (error) {
-    $("status").textContent = "Catalog error: " + error.message;
+    items = [];
+    canGoNext = false;
+    $("grid").replaceChildren();
+    $("status").textContent =
+      "Catalog error: " + error.message;
+  } finally {
+    loading = false;
+    render();
   }
 }
 
 $("prev").addEventListener("click", () => {
-  if (currentPage > 1) {
+  if (!loading && currentPage > 1) {
     currentPage--;
     loadCatalog();
   }
 });
 
 $("next").addEventListener("click", () => {
-  if (canGoNext) {
+  if (!loading && canGoNext) {
     currentPage++;
     loadCatalog();
   }
@@ -423,6 +525,7 @@ $("next").addEventListener("click", () => {
 
 $("search").addEventListener("input", render);
 $("kind").addEventListener("change", render);
+
 loadCatalog();
 </script>
 </body>
@@ -439,21 +542,29 @@ module.exports = async function handler(req, res) {
   }
 
   if (pathname === "/" || pathname === "/index.html") {
-    return send(res, 200, pageHtml(), "text/html; charset=utf-8");
+    return send(
+      res,
+      200,
+      pageHtml(),
+      "text/html; charset=utf-8"
+    );
   }
 
   if (pathname === "/health") {
     return send(res, 200, {
       ok: true,
       service: "ctg-movies-bridge",
-      worker: WORKER_API
+      workerConfigured: Boolean(WORKER_API)
     });
   }
 
   if (pathname === "/api/catalog") {
+    const requestedPage =
+      Number(url.searchParams.get("page")) || 1;
+
     const page = Math.max(
       1,
-      Math.min(10000, Number(url.searchParams.get("page")) || 1)
+      Math.min(10000, Math.floor(requestedPage))
     );
 
     try {
@@ -473,10 +584,14 @@ module.exports = async function handler(req, res) {
         ok: false,
         error: error.message,
         page,
-        hint: "Worker request failed or returned an unsupported response format."
+        hint:
+          "Check Cloudflare Worker reachability and response format."
       });
     }
   }
 
-  return send(res, 404, { ok: false, error: "Not found" });
+  return send(res, 404, {
+    ok: false,
+    error: "Not found"
+  });
 };

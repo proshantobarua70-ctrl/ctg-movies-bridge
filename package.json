@@ -1,0 +1,15 @@
+
+{
+  "name": "ctg-movies-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CTG Movies catalog bridge",
+  "main": "index.js",
+  "engines": {
+    "node": "22.x"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {}
+}
